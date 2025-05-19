@@ -122,6 +122,7 @@ DEFINE_string(
     "seekrandom,"
     "seekrandomwhilewriting,"
     "seekrandomwhilemerging,"
+    "seekrandomsession"
     "readseq,"
     "readreverse,"
     "compact,"
@@ -212,6 +213,7 @@ DEFINE_string(
     "overwrite\n"
     "\tseekrandomwhilemerging -- seekrandom and 1 thread doing "
     "merge\n"
+    "\tseekrandomsession    -- N random seeks, seeks all timestamp in sessionid\n"
     "\tcrc32c        -- repeated crc32c of <block size> data\n"
     "\txxhash        -- repeated xxHash of <block size> data\n"
     "\txxhash64      -- repeated xxHash64 of <block size> data\n"
@@ -793,6 +795,13 @@ DEFINE_bool(use_existing_keys, false,
             "same read/overwrite benchmarks as `-use_existing_db=true`, which "
             "must also be set for this flag to be enabled. When this flag is "
             "set, the value for `-num` will be ignored.");
+DEFINE_bool(use_existing_sessionid, false,
+              "If true, restore sessionid from DB "
+              "rather than starting from zero. This involves some startup "
+              "latency to find biggest key into memory. It is supported for the "
+              "same read/overwrite benchmarks as `-use_existing_db=true`, which "
+              "must also be set for this flag to be enabled."
+            );
 
 DEFINE_bool(show_table_properties, false,
             "If true, then per-level table"
@@ -3648,6 +3657,8 @@ class Benchmark {
       } else if (name == "seekrandomwhilemerging") {
         num_threads++;  // Add extra thread for merging
         method = &Benchmark::SeekRandomWhileMerging;
+      }else if(name == "seekrandomsession"){
+        method=&Benchmark::SeekRandomSession;
       } else if (name == "readrandomsmall") {
         reads_ /= 1000;
         method = &Benchmark::ReadRandom;
@@ -4901,6 +4912,30 @@ class Benchmark {
       }
       delete iter;
       FLAGS_num = keys_.size();
+    }
+    if(FLAGS_use_existing_sessionid){
+      // Only work on single database
+      assert(db_.db != nullptr);
+      ReadOptions read_opts;  
+      read_opts.total_order_seek = true;
+      Iterator* iter = db_.db->NewIterator(read_opts);
+      iter->SeekToLast();
+      assert(keys_per_prefix_<=0);
+      auto data=iter->key().data();
+
+      int bytes_to_read = std::min(key_size_, 8);
+
+      uint64_t out_sessionid=0;
+      if (port::kLittleEndian) {
+        for (int i = 0; i < bytes_to_read; ++i) {
+          out_sessionid |= static_cast<uint64_t>(static_cast<unsigned char>(data[i])) << ((bytes_to_read - i - 1)<<3);
+        }
+      } else {
+        memcpy(&out_sessionid, data, bytes_to_read);
+      }
+      sessionid=out_sessionid+1;
+      std::cout<<"loaded existing sessionid:"<<sessionid<<std::endl;
+      delete iter;
     }
   }
 
@@ -6990,6 +7025,148 @@ class Benchmark {
     }
   }
 
+  void SeekRandomSession(ThreadState* thread) {
+    int64_t read = 0;
+    int64_t found = 0;
+    int64_t bytes = 0;
+    ReadOptions options = read_options_;
+    std::unique_ptr<char[]> ts_guard;
+    Slice ts;
+
+    std::vector<Iterator*> tailing_iters;
+    if (FLAGS_use_tailing_iterator) {
+      if (db_.db != nullptr) {
+        tailing_iters.push_back(db_.db->NewIterator(options));
+      } else {
+        for (const auto& db_with_cfh : multi_dbs_) {
+          tailing_iters.push_back(db_with_cfh.db->NewIterator(options));
+        }
+      }
+    }
+    options.auto_prefix_mode = FLAGS_auto_prefix_mode;
+
+//    std::unique_ptr<const char[]> key_guard;
+//    Slice key = AllocateKey(&key_guard);
+
+    std::unique_ptr<const char[]> upper_bound_key_guard;
+    Slice upper_bound = AllocateKey(&upper_bound_key_guard);
+    std::unique_ptr<const char[]> lower_bound_key_guard;
+    Slice lower_bound = AllocateKey(&lower_bound_key_guard);
+
+    Duration duration(FLAGS_duration, reads_);
+    char value_buffer[256];
+    std::unique_ptr<ManagedSnapshot> snapshot = nullptr;
+    if (FLAGS_explicit_snapshot) {
+      snapshot = std::make_unique<ManagedSnapshot>(db_.db);
+      options.snapshot = snapshot->snapshot();
+    } else {
+      options.snapshot = nullptr;
+    }
+    while (!duration.Done(1)) {
+      int64_t max_sessionid=sessionid;
+      int64_t target_sessionid = thread->rand.Next() % max_sessionid;
+      
+      GenerateKeyFromInt(target_sessionid, FLAGS_num, &lower_bound);
+      {
+              // Write timestamp
+
+      char* start = const_cast<char*>(lower_bound.data());
+      char* pos = start + 8;
+      int bytes_to_fill =
+          std::min(key_size_ - static_cast<int>(pos - start), 8);
+      uint64_t timestamp_value = 0;
+      if (port::kLittleEndian) {
+        for (int i = 0; i < bytes_to_fill; ++i) {
+          pos[i] = (timestamp_value >> ((bytes_to_fill - i - 1) << 3)) & 0xFF;
+        }
+      } else {
+        memcpy(pos, static_cast<void*>(&timestamp_value), bytes_to_fill);
+      }
+      }
+      options.iterate_lower_bound = &lower_bound;
+      
+      GenerateKeyFromIntForSeek(static_cast<uint64_t>(target_sessionid), FLAGS_num,
+      &upper_bound);
+      {
+              // Write timestamp
+
+      char* start = const_cast<char*>(upper_bound.data());
+      char* pos = start + 8;
+      int bytes_to_fill =
+          std::min(key_size_ - static_cast<int>(pos - start), 8);
+      uint64_t timestamp_value = std::numeric_limits<uint64_t>::max();
+      if (port::kLittleEndian) {
+        for (int i = 0; i < bytes_to_fill; ++i) {
+          pos[i] = (timestamp_value >> ((bytes_to_fill - i - 1) << 3)) & 0xFF;
+        }
+      } else {
+        memcpy(pos, static_cast<void*>(&timestamp_value), bytes_to_fill);
+      }
+      }
+      options.iterate_upper_bound = &upper_bound;
+      
+      // Pick a Iterator to use
+      uint64_t db_idx_to_use =
+          (db_.db == nullptr)
+              ? (uint64_t{thread->rand.Next()} % multi_dbs_.size())
+              : 0;
+      std::unique_ptr<Iterator> single_iter;
+      Iterator* iter_to_use;
+      if (FLAGS_use_tailing_iterator) {
+        iter_to_use = tailing_iters[db_idx_to_use];
+      } else {
+        if (db_.db != nullptr) {
+          single_iter.reset(db_.db->NewIterator(options));
+        } else {
+          single_iter.reset(multi_dbs_[db_idx_to_use].db->NewIterator(options));
+        }
+        iter_to_use = single_iter.get();
+      }
+      if(FLAGS_reverse_iterator){
+        iter_to_use->SeekForPrev(upper_bound);
+      }else{
+        iter_to_use->Seek(lower_bound);
+      }
+
+      read++;
+      if (iter_to_use->Valid()) {
+        found++;
+      }
+
+      while(iter_to_use->Valid()){
+        // Copy out iterator's value to make sure we read them.
+        Slice value = iter_to_use->value();
+        memcpy(value_buffer, value.data(),
+               std::min(value.size(), sizeof(value_buffer)));
+        bytes += iter_to_use->key().size() + iter_to_use->value().size();
+
+        if (!FLAGS_reverse_iterator) {
+          iter_to_use->Next();
+        } else {
+          iter_to_use->Prev();
+        }
+        assert(iter_to_use->status().ok());
+      }
+
+      if (thread->shared->read_rate_limiter.get() != nullptr &&
+          read % 256 == 255) {
+        thread->shared->read_rate_limiter->Request(
+            256, Env::IO_HIGH, nullptr /* stats */, RateLimiter::OpType::kRead);
+      }
+
+      thread->stats.FinishedOps(&db_, db_.db, 1, kSeek);
+    }
+    for (auto iter : tailing_iters) {
+      delete iter;
+    }
+
+    char msg[100];
+    snprintf(msg, sizeof(msg), "(%" PRIu64 " of %" PRIu64 " found)\n", found,
+             read);
+    thread->stats.AddBytes(bytes);
+    thread->stats.AddMessage(msg);
+  }
+
   void DoDelete(ThreadState* thread, bool seq) {
     WriteBatch batch(/*reserved_bytes=*/0, /*max_bytes=*/0,
                      FLAGS_write_batch_protection_bytes_per_key,
@@ -8380,7 +8557,12 @@ class Benchmark {
       thread->stats.AddBytes(bytes);
 
     }
+    char msg[100];
+    snprintf(msg, sizeof(msg), "( last sessionid:%" PRIu64 ")", sessionid.load());
+    thread->stats.AddMessage(msg);
   }
+
+  
   void TimeSeriesMerge(ThreadState* thread) {
     RandomGenerator gen;
     int64_t bytes = 0;
@@ -8431,7 +8613,7 @@ class Benchmark {
 
     // Print some statistics
     char msg[100];
-    snprintf(msg, sizeof(msg), "( updates:%" PRIu64 ")", readwrites_);
+    snprintf(msg, sizeof(msg), "( updates:%" PRIu64 " sessionid:%" PRIu64 ")", readwrites_,sessionid.load());
     thread->stats.AddBytes(bytes);
     thread->stats.AddMessage(msg);
   }
@@ -8891,6 +9073,12 @@ int db_bench_tool(int argc, char** argv, ToolHooks& hooks) {
   if (FLAGS_use_existing_keys && !FLAGS_use_existing_db) {
     fprintf(stderr,
             "`-use_existing_db` must be true for `-use_existing_keys` to be "
+            "settable\n");
+    exit(1);
+  }
+  if (FLAGS_use_existing_sessionid && !FLAGS_use_existing_db) {
+    fprintf(stderr,
+            "`-use_existing_db` must be true for `-use_existing_sessionid` to be "
             "settable\n");
     exit(1);
   }
